@@ -14,7 +14,7 @@ from diffusers.schedulers import (DDIMScheduler, LMSDiscreteScheduler,
 from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
 
 
-class StableDiffusionPipeline(DiffusionPipeline):
+class StableDiffusionWalkPipeline(DiffusionPipeline):
     def __init__(
         self,
         vae: AutoencoderKL,
