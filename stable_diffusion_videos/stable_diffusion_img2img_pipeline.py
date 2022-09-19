@@ -7,11 +7,10 @@ import torch
 import PIL
 from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
 
-from ...models import AutoencoderKL, UNet2DConditionModel
-from ...pipeline_utils import DiffusionPipeline
-from ...schedulers import DDIMScheduler, LMSDiscreteScheduler, PNDMScheduler
-from . import StableDiffusionPipelineOutput
-from .safety_checker import StableDiffusionSafetyChecker
+from diffusers import AutoencoderKL, UNet2DConditionModel
+from diffusers import DiffusionPipeline
+from diffusers import DDIMScheduler, LMSDiscreteScheduler, PNDMScheduler
+from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 
 
 def preprocess(image):
@@ -24,7 +23,7 @@ def preprocess(image):
     return 2.0 * image - 1.0
 
 
-class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
+class StableDiffusionWalkImg2ImgPipeline(DiffusionPipeline):
     r"""
     Pipeline for text-guided image to image generation using Stable Diffusion.
 
@@ -104,8 +103,9 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
     @torch.no_grad()
     def __call__(
         self,
-        prompt: Union[str, List[str]],
-        init_image: Union[torch.FloatTensor, PIL.Image.Image],
+        text_embeddings: Optional[torch.FloatTensor] = None,
+        init_latents: Optional[torch.FloatTensor] = None,
+        init_image: Union[torch.FloatTensor, PIL.Image.Image,None] = None,
         strength: float = 0.8,
         num_inference_steps: Optional[int] = 50,
         guidance_scale: Optional[float] = 7.5,
@@ -158,12 +158,7 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
             list of `bool`s denoting whether the corresponding generated image likely represents "not-safe-for-work"
             (nsfw) content, according to the `safety_checker`.
         """
-        if isinstance(prompt, str):
-            batch_size = 1
-        elif isinstance(prompt, list):
-            batch_size = len(prompt)
-        else:
-            raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
+        batch_size = 1
 
         if strength < 0 or strength > 1:
             raise ValueError(f"The value of strength should in [0.0, 1.0] but is {strength}")
@@ -178,16 +173,17 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
 
         self.scheduler.set_timesteps(num_inference_steps, **extra_set_kwargs)
 
-        if not isinstance(init_image, torch.FloatTensor):
-            init_image = preprocess(init_image)
+        init_image_is_same = (init_latents is None)
+        if init_image_is_same:
+            if not isinstance(init_image, torch.FloatTensor):
+                init_image = preprocess(init_image)
+            # encode the init image into latents and scale the latents
+            init_latent_dist = self.vae.encode(init_image.to(self.device)).latent_dist
+            init_latents = init_latent_dist.sample(generator=generator)
+            init_latents = 0.18215 * init_latents
 
-        # encode the init image into latents and scale the latents
-        init_latent_dist = self.vae.encode(init_image.to(self.device)).latent_dist
-        init_latents = init_latent_dist.sample(generator=generator)
-        init_latents = 0.18215 * init_latents
-
-        # expand init_latents for batch_size
-        init_latents = torch.cat([init_latents] * batch_size)
+            # expand init_latents for batch_size
+            init_latents = torch.cat([init_latents] * batch_size)
 
         # get the original timestep using init_timestep
         init_timestep = int(num_inference_steps * strength) + offset
@@ -200,19 +196,10 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
             timesteps = self.scheduler.timesteps[-init_timestep]
             timesteps = torch.tensor([timesteps] * batch_size, dtype=torch.long, device=self.device)
 
+#        if init_image_is_same:
         # add noise to latents using the timesteps
         noise = torch.randn(init_latents.shape, generator=generator, device=self.device)
         init_latents = self.scheduler.add_noise(init_latents, noise, timesteps).to(self.device)
-
-        # get prompt text embeddings
-        text_input = self.tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=self.tokenizer.model_max_length,
-            truncation=True,
-            return_tensors="pt",
-        )
-        text_embeddings = self.text_encoder(text_input.input_ids.to(self.device))[0]
 
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
@@ -220,9 +207,10 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
         do_classifier_free_guidance = guidance_scale > 1.0
         # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance:
-            max_length = text_input.input_ids.shape[-1]
+            #max_length = text_input.input_ids.shape[-1]
+            max_length = 77  # self.tokenizer.model_max_length
             uncond_input = self.tokenizer(
-                [""] * batch_size, padding="max_length", max_length=max_length, return_tensors="pt"
+                [""] * batch_size, padding="max_length", max_length=self.tokenizer.model_max_length, return_tensors="pt"
             )
             uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(self.device))[0]
 
@@ -240,7 +228,7 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
         if accepts_eta:
             extra_step_kwargs["eta"] = eta
 
-        latents = init_latents
+        latents = init_latents.to(self.device)
 
         t_start = max(num_inference_steps - init_timestep + offset, 0)
         for i, t in enumerate(self.progress_bar(self.scheduler.timesteps[t_start:])):
@@ -285,7 +273,62 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
         if output_type == "pil":
             image = self.numpy_to_pil(image)
 
-        if not return_dict:
-            return (image, has_nsfw_concept)
+        return {"sample": image, "nsfw_content_detected": has_nsfw_concept}
 
-        return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+    def embed_text(self, text):
+        """Helper to embed some text"""
+        with torch.autocast("cuda"):
+            text_input = self.tokenizer(
+                text,
+                padding="max_length",
+                max_length=self.tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            with torch.no_grad():
+                embed = self.text_encoder(text_input.input_ids.to(self.device))[0]
+        return embed
+
+    def img2latents(
+            self,
+            init_image: Union[torch.FloatTensor, PIL.Image.Image],
+            generator: Optional[torch.Generator] = None,
+            strength: float = 0.8,
+            num_inference_steps: Optional[int] = 50,
+            device: Optional[torch.device] = None,
+        ):
+
+        accepts_offset = "offset" in set(inspect.signature(self.scheduler.set_timesteps).parameters.keys())
+        offset = 0
+        if accepts_offset:
+            offset = 1
+
+        if not isinstance(init_image, torch.FloatTensor):
+            init_image = preprocess(init_image)
+
+        batch_size = 1
+        # encode the init image into latents and scale the latents
+        init_latent_dist = self.vae.encode(init_image.to(device)).latent_dist
+        init_latents = init_latent_dist.sample(generator=generator)
+        init_latents = 0.18215 * init_latents
+
+        # expand init_latents for batch_size
+        init_latents = torch.cat([init_latents] * batch_size)
+
+        return init_latents
+
+        # get the original timestep using init_timestep
+        init_timestep = int(num_inference_steps * strength) + offset
+        init_timestep = min(init_timestep, num_inference_steps)
+        if isinstance(self.scheduler, LMSDiscreteScheduler):
+            timesteps = torch.tensor(
+                [num_inference_steps - init_timestep] * batch_size, dtype=torch.long, device=self.device
+            )
+        else:
+            timesteps = self.scheduler.timesteps[-init_timestep]
+            timesteps = torch.tensor([timesteps] * batch_size, dtype=torch.long, device=self.device)
+
+        # add noise to latents using the timesteps
+        noise = torch.randn(init_latents.shape, generator=generator, device=self.device)
+        init_latents = self.scheduler.add_noise(init_latents, noise, timesteps)
+
